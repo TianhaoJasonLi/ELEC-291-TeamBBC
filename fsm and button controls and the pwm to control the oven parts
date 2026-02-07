@@ -1,0 +1,1120 @@
+$MODMAX10
+
+CSEG at 0
+    ljmp main
+
+
+
+ORG 000Bh
+    ljmp Timer0_ISR
+; ----------------------------
+; LCD pin mapping
+; ----------------------------
+ELCD_RS  EQU P1.1
+ELCD_E   EQU P1.7
+
+ELCD_D4  EQU P0.1
+ELCD_D5  EQU P0.3
+ELCD_D6  EQU P0.5
+ELCD_D7  EQU P0.7
+
+
+
+; ----------------------------
+; DE10-Lite CV-8052 guide notes:
+; - KEY0 is the RESET button, so we DO NOT use it for Start/Stop.
+; - Use KEY1 (KEY.1) for Start/Pause.
+; - Use SW0 (SWA.0) as STOP.
+; KEY SFR is bit-addressable at F8h.
+; ----------------------------
+START_BTN BIT KEY.1     ; DE10 KEY1 (active-low)
+STOP_SW   BIT SWA.0     ; DE10 SW0  (active-high)
+
+; SSR output (edit to match your wiring)
+SSR_OUT   BIT P3.7      ; wire the ssr to 3.7
+
+; ----------------------------
+; Timer0 10ms reload (assumes timer ticks at Fosc/12; Fosc=33.333333MHz)
+; tick = 12/Fosc = 360ns => 10ms counts ~27778 => reload = 65536-27778=0x937E
+; If your build uses a different clock/timer tick, adjust these.
+; ----------------------------
+T0_RELOAD_H EQU 093h
+T0_RELOAD_L EQU 07Eh
+DEB_N       EQU 3       ; debounce = 3*10ms = 30ms
+; ----------------------------
+; RAM
+; ----------------------------
+DSEG at 30H
+Timer_Hour:      ds 1
+Timer_Minute:    ds 1
+Timer_Second:    ds 1
+Timer_Run:       ds 1
+
+EditIndex:       ds 1
+BlinkDiv:        ds 1
+BlinkFlag:       ds 1
+SecDiv:          ds 1
+
+Clock_Hour:      ds 1
+Clock_Minute:    ds 1
+Clock_Second:    ds 1
+
+Temperature:     ds 1
+Controller_Mode: ds 1
+
+Soak_Temp:       ds 1
+Soak_Min:        ds 1
+Soak_Sec:        ds 1
+
+Reflow_Temp:     ds 1
+Reflow_Min:      ds 1
+Reflow_Sec:      ds 1
+
+Stage:           ds 1        ; 0=IDLE,1=SOAK,2=REFLOW,3=DONE (example)
+
+; temp scratch for numeric entry
+EntryValue:      ds 1        ; binary or packed BCD depending on mode
+
+; ----------------------------
+; CODE
+; ----------------------------
+
+; ---- include LCD driver (no RW) ----
+;  LCD routines adapted for the DE10-Lite configured as a CV_8052 processor
+cseg
+
+; When using a 33.333333MHz crystal clock
+; one cycle takes 1.0/33.333333MHz = 30 ns
+
+;---------------------------------;
+; Wait 40 microseconds            ;
+;---------------------------------;
+Wait40uSec:
+	push AR0
+	mov R0, #190
+L0: 
+	nop
+	nop
+	nop
+	nop
+	djnz R0, L0 ; 1+1+1+1+3 cycles->7*30ns*190=40us
+	pop AR0
+    ret
+
+;---------------------------------;
+; Wait 'R2' milliseconds          ;
+;---------------------------------;
+Wait_Milli_Seconds mac
+	push AR2
+	mov R2, %0
+	lcall ?Wait_Milli_Seconds
+	pop AR2
+endmac
+
+?Wait_Milli_Seconds:
+	push AR0
+	push AR1
+L3: mov R1, #50
+L2: mov R0, #223
+L1: djnz R0, L1 ; 3 cycles->3*30ns*250=20.07us
+    djnz R1, L2 ; 20.07us*50=1.004ms
+    djnz R2, L3 ; number of millisecons to wait passed in R2
+    pop AR1
+    pop AR0
+    ret
+	
+;---------------------------------;
+; Toggles the 'E' pin in the LCD  ;
+;---------------------------------;
+ELCD_pulse:
+	setb ELCD_E
+	lcall Wait40uSec
+	clr ELCD_E
+    lcall Wait40uSec ; This line is needed in the DE1SoC running an 8051 because it is much faster than the AT89LP51RC2
+    ret
+
+;---------------------------------;
+; Writes acc to LCD in 4-bit mode ;
+;---------------------------------;
+ELCD_byte:
+	; Write high 4 bits first
+	mov c, ACC.7
+	mov ELCD_D7, c
+	mov c, ACC.6
+	mov ELCD_D6, c
+	mov c, ACC.5
+	mov ELCD_D5, c
+	mov c, ACC.4
+	mov ELCD_D4, c
+    lcall ELCD_pulse
+	; Write low 4 bits next
+	mov c, ACC.3
+	mov ELCD_D7, c
+	mov c, ACC.2
+	mov ELCD_D6, c
+	mov c, ACC.1
+	mov ELCD_D5, c
+	mov c, ACC.0
+	mov ELCD_D4, c
+    lcall ELCD_pulse
+	ret
+
+;---------------------------------;
+; Write data to LCD               ;
+;---------------------------------;
+WriteData mac
+	mov a, %0
+	lcall ?WriteData
+endmac
+	
+?WriteData:
+	setb ELCD_RS
+	ljmp ELCD_byte
+
+;---------------------------------;
+; Write command to LCD            ;
+;---------------------------------;
+WriteCommand mac
+	mov a, %0
+	lcall ?WriteCommand
+endmac
+
+?WriteCommand:
+	clr ELCD_RS
+	ljmp ELCD_byte
+
+;---------------------------------;
+; Configure LCD in 4-bit mode     ;
+;---------------------------------;
+ELCD_4BIT:
+	clr ELCD_E   ; Resting state of LCD's enable pin is zero
+	;clr ELCD_RW  ; RW forced to zero
+	
+	; After power on, let the LCD start up before initializing
+	Wait_Milli_Seconds(#40)
+	
+	; First make sure the LCD is in 8-bit mode and then change to 4-bit mode
+	WriteCommand(#0x33)
+	WriteCommand(#0x33)
+	WriteCommand(#0x32) ; change to 4-bit mode
+
+	; Configure the LCD
+	WriteCommand(#0x28)
+	WriteCommand(#0x0c)
+	WriteCommand(#0x01) ;  Clear screen command (takes some time)
+
+    ;Wait for the clear screen command to finish.
+	Wait_Milli_Seconds(#2)
+    ret
+
+;---------------------------------;
+; Send a constant string to LCD   ;
+;---------------------------------;
+Send_Constant_String mac
+	push dph
+	push dpl
+	push acc
+	mov dptr, %0
+	lcall ?Send_Constant_String
+	pop acc
+	pop dpl
+	pop dph
+endmac
+
+?Send_Constant_String:
+    clr a
+    movc a, @a+dptr
+    jz ?Send_Constant_String_Done
+    lcall ?WriteData
+    inc dptr
+    sjmp ?Send_Constant_String
+?Send_Constant_String_Done:
+    ret	
+
+;---------------------------------;
+; Set LCD cursor at row, column   ;
+;---------------------------------;
+Set_Cursor mac
+	push acc
+	mov a, #%1
+	dec a
+	lcall ?Set_Cursor_%0 ; Select column and row
+	pop acc
+endmac
+
+?Set_Cursor_2:
+	orl a, #01000000B
+?Set_Cursor_1:
+	orl a, #10000000B
+	ljmp ?WriteCommand ; Select column and row
+
+;---------------------------------;
+; Display a BCD number in the LCD ;
+;---------------------------------;
+Display_BCD mac
+	push ar0
+	mov r0, %0
+	lcall ?Display_BCD
+	pop ar0
+endmac
+
+?Display_BCD:
+	push acc
+	; Write most significant digit
+	mov a, r0
+	swap a
+	anl a, #0fh
+	orl a, #30h
+	lcall ?WriteData
+	; write least significant digit
+	mov a, r0
+	anl a, #0fh
+	orl a, #30h
+	lcall ?WriteData
+	pop acc
+	ret
+
+;------------------------------------;
+; Display a char in the LCD          ;
+;------------------------------------;
+Display_char mac
+	push acc
+	mov a, %0
+	lcall ?WriteData
+	pop acc
+endmac
+
+; ----------------------------
+; Keypad code (based on Read_keypad.asm)
+; returns: Carry=1 if key pressed, keycode in R7
+; ----------------------------
+Wait25ms:
+    mov R0, #15
+KP_L3: mov R1, #74
+KP_L2: mov R2, #250
+KP_L1: djnz R2, KP_L1
+       djnz R1, KP_L2
+       djnz R0, KP_L3
+       ret
+
+CHECK_COLUMN MAC
+    jb %0, CHECK_COL_%M
+    mov R7, %1
+    jnb %0, $        ; wait release
+    setb c
+    ret
+CHECK_COL_%M:
+ENDMAC
+
+Configure_Keypad_Pins:
+    ; rows out: P1.2,P1.4,P1.6,P2.0
+    ; cols in:  P2.2,P2.4,P2.6,P3.0
+    orl P1MOD, #0b_01010100
+    orl P2MOD, #0b_00000001
+    anl P2MOD, #0b_10101011
+    anl P3MOD, #0b_11111110
+    ret
+
+ROW1 EQU P1.2
+ROW2 EQU P1.4
+ROW3 EQU P1.6
+ROW4 EQU P2.0
+COL1 EQU P2.2
+COL2 EQU P2.4
+COL3 EQU P2.6
+COL4 EQU P3.0
+
+Keypad:
+    ; make all rows 0, see if any col goes 0
+    clr ROW1
+    clr ROW2
+    clr ROW3
+    clr ROW4
+    mov c, COL1
+    anl c, COL2
+    anl c, COL3
+    anl c, COL4
+    jnc KP_Debounce
+    clr c
+    ret
+
+KP_Debounce:
+    lcall Wait25ms
+    mov c, COL1
+    anl c, COL2
+    anl c, COL3
+    anl c, COL4
+    jnc KP_KeyCode
+    clr c
+    ret
+
+KP_KeyCode:
+    setb ROW1
+    setb ROW2
+    setb ROW3
+    setb ROW4
+
+    ; default layout section (same as your lab)
+    clr ROW1
+    CHECK_COLUMN(COL1, #01H)
+    CHECK_COLUMN(COL2, #02H)
+    CHECK_COLUMN(COL3, #03H)
+    CHECK_COLUMN(COL4, #0AH)
+    setb ROW1
+
+    clr ROW2
+    CHECK_COLUMN(COL1, #04H)
+    CHECK_COLUMN(COL2, #05H)
+    CHECK_COLUMN(COL3, #06H)
+    CHECK_COLUMN(COL4, #0BH)
+    setb ROW2
+
+    clr ROW3
+    CHECK_COLUMN(COL1, #07H)
+    CHECK_COLUMN(COL2, #08H)
+    CHECK_COLUMN(COL3, #09H)
+    CHECK_COLUMN(COL4, #0CH)
+    setb ROW3
+
+    clr ROW4
+    CHECK_COLUMN(COL1, #0EH)
+    CHECK_COLUMN(COL2, #00H)
+    CHECK_COLUMN(COL3, #0FH)
+    CHECK_COLUMN(COL4, #0DH)
+    setb ROW4
+
+    clr c
+    ret
+    
+Configure_LCD_Pins:
+    ; P0.1, P0.3, P0.5, P0.7 = outputs (D4..D7)
+    orl P0MOD, #0b_10101010
+
+    ; P1.1 and P1.7 = outputs (RS and E)
+    orl P1MOD, #0b_10000010
+    ret
+
+; ----------------------------
+; UI helpers
+; ----------------------------
+KEY_A   EQU 0AH
+KEY_B   EQU 0BH
+KEY_C   EQU 0CH
+KEY_D   EQU 0DH     ; NEXT
+KEY_STAR EQU 0EH    ; CLEAR
+KEY_HASH EQU 0FH    ; START/STOP on stats
+
+; ----------------------------
+; MAIN
+; ----------------------------
+
+; ===== Added for Timer ISR + PWM + FSM =====
+flag_10ms:      ds 1
+flag_1s:        ds 1
+tick_10ms:      ds 1
+pwm_phase:      ds 1
+
+StageSec:       ds 1
+PWM_Duty:       ds 1
+Soak_TimeSec:   ds 1
+Reflow_TimeSec: ds 1
+AbortTimer:     ds 1
+Reached50:      ds 1
+
+StartStable:    ds 1
+StartCnt:       ds 1
+main:
+    mov SP, #7FH
+
+    lcall Configure_LCD_Pins
+    lcall Configure_Keypad_Pins
+
+    ; wait ~500ms after power
+    mov r0, #20
+Delay:
+    lcall Wait25ms
+    djnz r0, Delay
+
+    lcall ELCD_4BIT
+
+    Set_Cursor(1,1)
+    Send_Constant_String(#MSG)
+
+
+    ; --- init reflow control ---
+    lcall Init_Reflow_Vars
+    lcall Configure_SSR_Pin
+    lcall Init_Timer0_10ms
+
+    sjmp MainLoop
+; ---- THIS is where MSG goes ----
+MSG:
+    db 'HELLO', 0
+
+MainLoop:
+    ; 10ms tasks
+    mov a, flag_10ms
+    jz  ML_check_1s
+    mov flag_10ms, #0
+    lcall Scan_Buttons_10ms
+
+    ; UI tasks (LCD + keypad)
+    lcall Render_Screen
+    lcall Keypad
+    jnc ML_check_1s
+    lcall Handle_Key
+
+ML_check_1s:
+    mov a, flag_1s
+    jz  MainLoop
+    mov flag_1s, #0
+    ; 1Hz tasks: run FSM (Temperature should be updated elsewhere)
+    mov a, Timer_Run
+    jz  MainLoop
+    lcall FSM1_Reflow
+    sjmp MainLoop
+
+
+; ----------------------------
+; Handle_Key: keycode in R7
+; ----------------------------
+Handle_Key:
+    mov a, R7
+
+    ; NEXT mode?
+    cjne a, #KEY_D, HK_NotNext
+    mov a, Controller_Mode
+    inc a
+    cjne a, #5, HK_SetMode
+    clr a
+HK_SetMode:
+    mov Controller_Mode, a
+    ret
+HK_NotNext:
+
+    ; CLEAR?
+    cjne a, #KEY_STAR, HK_NotClear
+    lcall Clear_Current_Mode_Value
+    ret
+HK_NotClear:
+    ; (Start/Stop moved to DE10 KEY1 and SW0; keypad HASH no longer toggles run)
+HK_NotStats:
+    ; numeric entry (0..9) only
+    mov a, R7
+    cjne a, #0AH, HK_MaybeDigit   ; if <0x0A, it's a digit
+HK_MaybeDigit:
+    jc HK_IsDigit
+    ret
+
+HK_IsDigit:
+    ; a = digit 0..9
+    mov b, a
+    lcall Apply_Digit_To_Current_Mode
+    ret
+
+; ----------------------------
+; Clear current value
+; ----------------------------
+Clear_Current_Mode_Value:
+    mov a, Controller_Mode
+    jz CLR_SoakTemp
+    cjne a, #1, CLR_Check2
+    mov Soak_Min, #00h
+    mov Soak_Sec, #00h
+    ret
+CLR_Check2:
+    cjne a, #2, CLR_Check3
+    mov Soak_Temp, #0
+    ret
+CLR_Check3:
+    cjne a, #3, CLR_Done
+    mov Reflow_Min, #00h
+    mov Reflow_Sec, #00h
+    ret
+CLR_SoakTemp:
+    mov Soak_Temp, #0
+CLR_Done:
+    ret
+
+; ----------------------------
+; Apply digit to current mode
+; For temps: build binary 0..255 from decimal typed (simple 3-digit rolling)
+; For times: build mm:ss in BCD (two digits each, rolling)
+; ----------------------------
+Apply_Digit_To_Current_Mode:
+    ; b = digit (0..9)
+    mov a, Controller_Mode
+    jz AD_SoakTemp
+    cjne a, #1, AD_Check2
+    sjmp AD_SoakTime
+AD_Check2:
+    cjne a, #2, AD_Check3
+    sjmp AD_ReflowTemp
+AD_Check3:
+    cjne a, #3, AD_Done
+    sjmp AD_ReflowTime
+
+AD_SoakTemp:
+    ; Soak_Temp = (Soak_Temp*10 + digit) clamp to 255
+    mov a, Soak_Temp
+    mov r0, a
+    ; r0 = old
+    mov a, r0
+    mov b, #10
+    mul ab           ; A=low, B=high (8-bit only good for <=25)
+    ; quick+dirty: if B != 0, overflow -> clamp
+    mov a, b
+    jnz AD_TClamp
+    mov a, r0
+    mov b, #10
+    mul ab
+    add a, r7        ; add digit (still in R7? safer use digit in b)
+    ; use digit in B:
+    mov a, Soak_Temp
+    mov b, #10
+    mul ab
+    add a, b         ; (WRONG) -> keep it simple: re-do with digit in R7
+    ; ---- simplest correct way:
+    mov a, Soak_Temp
+    mov b, #10
+    mul ab
+    add a, R7        ; digit
+    jc AD_TClamp
+    mov Soak_Temp, a
+    ret
+AD_TClamp:
+    mov Soak_Temp, #255
+    ret
+
+AD_SoakTime:
+    ; Rolling entry: mm:ss as 4 digits: shift left 1 digit and add new digit
+    ; We store mm in Soak_Min BCD, ss in Soak_Sec BCD
+    lcall ShiftTimeBCDLeft_Soak
+    ret
+
+AD_ReflowTemp:
+    mov a, Reflow_Temp
+    mov b, #10
+    mul ab
+    add a, R7
+    jc AD_RTClamp
+    mov Reflow_Temp, a
+    ret
+AD_RTClamp:
+    mov Reflow_Temp, #255
+    ret
+
+AD_ReflowTime:
+    lcall ShiftTimeBCDLeft_Reflow
+AD_Done:
+    ret
+
+; shift mm:ss by one digit left and insert new digit (R7=0..9)
+ShiftTimeBCDLeft_Soak:
+    ; digits: [m_tens][m_ones][s_tens][s_ones]
+    ; Soak_Min = m_tens m_ones (BCD), Soak_Sec = s_tens s_ones (BCD)
+    mov a, Soak_Min
+    anl a, #0Fh
+    swap a
+    mov r0, a            ; new m_tens = old m_ones (in high nibble)
+
+    mov a, Soak_Sec
+    swap a
+    anl a, #0Fh
+	orl a, r0
+	mov r0, a
+
+    ; now build new min/sec:
+    ; new min: [old m_ones][old s_tens]
+    mov a, r0
+    mov Soak_Min, a      ; (temp) not final
+
+    ; new sec: [old s_ones][new digit]
+    mov a, Soak_Sec
+    anl a, #0Fh
+    swap a
+    orl a, R7
+    mov Soak_Sec, a
+
+    ; fix Soak_Min: currently [old m_ones][old s_tens] but swapped wrong
+    ; easiest: recompute properly:
+    mov a, Soak_Min
+    ; a high nibble = old m_ones, low nibble = old s_tens already ok
+    mov Soak_Min, a
+    ret
+
+ShiftTimeBCDLeft_Reflow:
+    mov a, Reflow_Min
+    anl a, #0Fh
+    swap a
+    mov r0, a
+
+    mov a, Reflow_Sec
+    swap a
+    anl a, #0Fh
+    orl a, r0
+    mov r0, a
+
+    mov a, r0
+    mov Reflow_Min, a
+
+    mov a, Reflow_Sec
+    anl a, #0Fh
+    swap a
+    orl a, R7
+    mov Reflow_Sec, a
+    ret
+
+; ----------------------------
+; Render screen (simple full redraw)
+; ----------------------------
+Render_Screen:
+    WriteCommand(#01h)         ; clear
+    Wait_Milli_Seconds(#2)
+
+    mov a, Controller_Mode
+    jz RS_SoakTemp
+    cjne a, #1, RS_Check2
+    sjmp RS_SoakTime
+RS_Check2:
+    cjne a, #2, RS_Check3
+    ljmp RS_ReflowTemp
+RS_Check3:
+    cjne a, #3, RS_Check4
+    ljmp RS_ReflowTime
+RS_Check4:
+    ljmp RS_Stats
+
+RS_SoakTemp:
+    Set_Cursor(1,1)
+    Send_Constant_String(#StrSoakTemp)
+    Set_Cursor(2,1)
+    Send_Constant_String(#StrVal)
+    ; display Soak_Temp as 3 digits crude (binary -> not implemented here)
+    ; easiest first step: show as 2-hex on LCD:
+    ; Display_BCD expects packed BCD, so for now show as hex nibble+nibble:
+    mov a, Soak_Temp
+    lcall DisplayHexByte
+    ret
+
+RS_SoakTime:
+    Set_Cursor(1,1)
+    Send_Constant_String(#StrSoakTime)
+    Set_Cursor(2,1)
+    mov a, Soak_Min
+    lcall ?Display_BCD
+    Display_char(#':')
+    mov a, Soak_Sec
+    lcall ?Display_BCD
+    ret
+
+RS_ReflowTemp:
+    Set_Cursor(1,1)
+    Send_Constant_String(#StrReflowTemp)
+    Set_Cursor(2,1)
+    mov a, Reflow_Temp
+    lcall DisplayHexByte
+    ret
+
+RS_ReflowTime:
+    Set_Cursor(1,1)
+    Send_Constant_String(#StrReflowTime)
+    Set_Cursor(2,1)
+    mov a, Reflow_Min
+    lcall ?Display_BCD
+    Display_char(#':')
+    mov a, Reflow_Sec
+    lcall ?Display_BCD
+    ret
+
+RS_Stats:
+    ; top row: Temp + Stage
+    Set_Cursor(1,1)
+    Send_Constant_String(#StrTemp)
+    mov a, Temperature
+    lcall DisplayHexByte
+    Send_Constant_String(#StrStage)
+    mov a, Stage
+    add a, #'0'
+    lcall ?WriteData
+
+    ; bottom row: running time
+    Set_Cursor(2,1)
+    Send_Constant_String(#StrRun)
+    mov a, Timer_Minute
+    lcall ?Display_BCD
+    Display_char(#':')
+    mov a, Timer_Second
+    lcall ?Display_BCD
+    ret
+
+; ---- small helper: show ACC as hex (two chars) ----
+DisplayHexByte:
+    push acc
+    mov b, a
+    swap a
+    anl a, #0Fh
+    lcall HexNibble
+    mov a, b
+    anl a, #0Fh
+    lcall HexNibble
+    pop acc
+    ret
+
+HexNibble:
+    ; A = 0..15
+    add a, #'0'
+    cjne a, #'9'+1, HN_Out
+    jc HN_Out
+    add a, #7     ; 'A' - ':' = 7
+HN_Out:
+    lcall ?WriteData
+    ret
+
+; ----------------------------
+; Strings (null-terminated)
+; ----------------------------
+StrSoakTemp:   db 'SOAK TEMP',0
+StrSoakTime:   db 'SOAK TIME',0
+StrReflowTemp: db 'REFLOW TMP',0
+StrReflowTime: db 'REFLOW TIME',0
+StrVal:        db 'VAL=',0
+StrTemp:       db 'T=',0
+StrStage:      db ' STG=',0
+StrRun:        db 'RUN ',0
+
+; ============================================================
+; Added: SSR pin config, Timer0 10ms ISR, Button scan, FSM
+; ============================================================
+
+Configure_SSR_Pin:
+    ; Make P3.7 an output (ports default to input).
+    orl P3MOD, #0b_10000000
+    clr SSR_OUT
+    ret
+
+; ----------------------------
+; Display current Stage on LEDR2..LEDR0 as a 3-bit binary number.
+; ----------------------------
+UpdateStage_LEDs:
+    mov a, Stage
+    anl a, #07h        ; keep 0..7
+    mov LEDRA, a       ; LEDR0=bit0, LEDR1=bit1, LEDR2=bit2
+    ret
+
+Init_Timer0_10ms:
+    mov TMOD, #01h        ; Timer0 mode 1 (16-bit)
+    mov TH0, #T0_RELOAD_H
+    mov TL0, #T0_RELOAD_L
+    clr TF0
+    setb ET0
+    setb EA
+    setb TR0
+    ret
+
+; ----------------------------
+; Timer0 ISR: 10ms tick
+; ----------------------------
+Timer0_ISR:
+    clr TF0
+    mov TH0, #T0_RELOAD_H
+    mov TL0, #T0_RELOAD_L
+
+    mov flag_10ms, #1
+
+    ; PWM carrier 0..99
+    mov a, pwm_phase
+    inc a
+    cjne a, #100, T0_pwm_ok
+    mov a, #0
+T0_pwm_ok:
+    mov pwm_phase, a
+
+    ; SSR_OUT = 1 if pwm_phase < PWM_Duty else 0
+    mov a, pwm_phase
+    clr c
+    subb a, PWM_Duty
+    jc  T0_pwm_on
+    clr SSR_OUT
+    sjmp T0_pwm_done
+T0_pwm_on:
+    setb SSR_OUT
+T0_pwm_done:
+
+    inc tick_10ms
+    cjne tick_10ms, #100, T0_exit
+    mov tick_10ms, #0
+    mov flag_1s, #1
+T0_exit:
+    reti
+
+; ----------------------------
+; Scan DE10 inputs every 10ms
+; Start/Pause: KEY1 (active-low). Note KEY0 is reset.
+; Stop: SW0 (active-high) independent of reset.
+; ----------------------------
+Scan_Buttons_10ms:
+
+    ; STOP via SW0 (active-high). Immediate.
+    jb STOP_SW, SB_do_stop
+    sjmp SB_start
+
+SB_do_stop:
+    mov Timer_Run, #0
+    lcall UpdateStage_LEDs
+    mov Stage, #0
+    mov StageSec, #0
+    mov PWM_Duty, #0
+    mov AbortTimer, #0
+    mov Reached50, #0
+    clr SSR_OUT
+    lcall UpdateStage_LEDs
+    ret
+
+SB_start:
+    ; START via KEY1 (active-low). Debounce + one-shot.
+    mov c, START_BTN
+    mov a, #0
+    jc  SB_not_pressed
+    mov a, #1
+SB_not_pressed:
+
+    cjne a, StartStable, SB_changed
+    mov a, StartCnt
+    cjne a, #DEB_N, SB_inc
+    sjmp SB_eval
+SB_inc:
+    inc StartCnt
+    sjmp SB_eval
+SB_changed:
+    mov StartCnt, #0
+    mov StartStable, a
+
+SB_eval:
+    mov a, StartCnt
+    cjne a, #DEB_N, SB_unlock
+    mov a, StartStable
+    jz  SB_unlock
+
+    ; one-shot action: toggle Timer_Run
+    mov a, Timer_Run
+    cpl a
+    mov Timer_Run, a
+
+    ; if turned ON: go to Stage1 and reset counters
+    mov a, Timer_Run
+    jz  SB_lock
+    lcall Compute_Times_8bit
+    mov Stage, #1
+    lcall UpdateStage_LEDs
+    mov StageSec, #0
+    mov AbortTimer, #0
+    mov Reached50, #0
+    mov PWM_Duty, #100
+    mov pwm_phase, #0
+SB_lock:
+    mov StartCnt, #DEB_N+1
+
+SB_unlock:
+    mov a, StartStable
+    jnz SB_done
+    mov StartCnt, #0
+SB_done:
+    ret
+
+; ----------------------------
+; Init Reflow runtime vars (called in main)
+; ----------------------------
+Init_Reflow_Vars:
+    mov Timer_Run, #0
+    lcall UpdateStage_LEDs
+    mov Stage, #0
+    mov StageSec, #0
+    mov PWM_Duty, #0
+    mov AbortTimer, #0
+    mov Reached50, #0
+    mov flag_10ms, #0
+    mov flag_1s, #0
+    mov tick_10ms, #0
+    mov pwm_phase, #0
+    mov StartStable, #0
+    mov StartCnt, #0
+    lcall Compute_Times_8bit
+    lcall UpdateStage_LEDs
+    ret
+
+; ----------------------------
+; Soak_TimeSec = Soak_Min*60 + Soak_Sec (clamp 255)
+; Reflow_TimeSec = Reflow_Min*60 + Reflow_Sec (clamp 255)
+; ----------------------------
+Compute_Times_8bit:
+    ; Soak
+    mov a, Soak_Min
+    mov b, #60
+    mul ab
+    mov a, b
+    jz  CTS_soak_ok
+    mov Soak_TimeSec, #255
+    sjmp CTS_reflow
+CTS_soak_ok:
+    mov a, Soak_Min
+    mov b, #60
+    mul ab
+    add a, Soak_Sec
+    jc  CTS_soak_ov
+    mov Soak_TimeSec, a
+    sjmp CTS_reflow
+CTS_soak_ov:
+    mov Soak_TimeSec, #255
+
+CTS_reflow:
+    mov a, Reflow_Min
+    mov b, #60
+    mul ab
+    mov a, b
+    jz  CTS_ref_ok
+    mov Reflow_TimeSec, #255
+    ret
+CTS_ref_ok:
+    mov a, Reflow_Min
+    mov b, #60
+    mul ab
+    add a, Reflow_Sec
+    jc  CTS_ref_ov
+    mov Reflow_TimeSec, a
+    ret
+CTS_ref_ov:
+    mov Reflow_TimeSec, #255
+    ret
+
+; ----------------------------
+; Safety abort: within first 60s must reach >=50C
+; ----------------------------
+SAFETY_ABORT_CHECK:
+    mov a, Temperature
+    clr c
+    subb a, #50
+    jc  SA_not50
+    mov Reached50, #1
+SA_not50:
+
+    mov a, AbortTimer
+    cjne a, #60, SA_inc
+
+    mov a, Reached50
+    jnz SA_ok
+
+    ; ABORT -> idle/off
+    mov Timer_Run, #0
+    lcall UpdateStage_LEDs
+    mov Stage, #0
+    mov StageSec, #0
+    mov PWM_Duty, #0
+    mov AbortTimer, #0
+    mov Reached50, #0
+    clr SSR_OUT
+    ret
+
+SA_inc:
+    inc AbortTimer
+SA_ok:
+    ret
+
+; ----------------------------
+; FSM: call once per second when Timer_Run==1
+; Stage: 0..5
+; ----------------------------
+FSM1_Reflow:
+    mov a, Stage
+
+FSM_s0:
+    cjne a, #0, FSM_s1
+    mov PWM_Duty, #0
+    mov StageSec, #0
+    ret
+
+FSM_s1:
+    cjne a, #1, FSM_s2
+    mov PWM_Duty, #100
+    lcall SAFETY_ABORT_CHECK
+    mov a, Soak_Temp
+    clr c
+    subb a, Temperature
+    jnc FSM_s1_stay
+    lcall UpdateStage_LEDs
+    mov Stage, #2
+    mov StageSec, #0
+    mov PWM_Duty, #20
+    ret
+FSM_s1_stay:
+    inc StageSec
+    ret
+
+FSM_s2:
+    cjne a, #2, FSM_s3
+    mov PWM_Duty, #20
+    lcall SAFETY_ABORT_CHECK
+    mov a, StageSec
+    clr c
+    subb a, Soak_TimeSec
+    jc  FSM_s2_stay
+    lcall UpdateStage_LEDs
+    mov Stage, #3
+    mov StageSec, #0
+    mov PWM_Duty, #100
+    ret
+FSM_s2_stay:
+    inc StageSec
+    ret
+
+FSM_s3:
+    cjne a, #3, FSM_s4
+    mov PWM_Duty, #100
+    mov a, Reflow_Temp
+    clr c
+    subb a, Temperature
+    jnc FSM_s3_stay
+    lcall UpdateStage_LEDs
+    mov Stage, #4
+    mov StageSec, #0
+    mov PWM_Duty, #20
+    ret
+FSM_s3_stay:
+    inc StageSec
+    ret
+
+FSM_s4:
+    cjne a, #4, FSM_s5
+    mov PWM_Duty, #20
+    mov a, StageSec
+    clr c
+    subb a, Reflow_TimeSec
+    jc  FSM_s4_stay
+    lcall UpdateStage_LEDs
+    mov Stage, #5
+    mov StageSec, #0
+    mov PWM_Duty, #0
+    ret
+FSM_s4_stay:
+    inc StageSec
+    ret
+
+FSM_s5:
+    cjne a, #5, FSM_done
+    mov PWM_Duty, #0
+    mov a, Temperature
+    clr c
+    subb a, #60
+    jc  FSM_s5_to_idle
+    ret
+FSM_s5_to_idle:
+    lcall UpdateStage_LEDs
+    mov Stage, #0
+    mov StageSec, #0
+    mov PWM_Duty, #0
+    ret
+
+FSM_done:
+    ret
+
+END
