@@ -1,0 +1,155 @@
+$MODMAX10
+
+CSEG at 0000h
+    ljmp main
+
+; LCD pins (按你说的 mapping)
+ELCD_RS  EQU P1.1
+ELCD_E   EQU P1.7
+ELCD_D4  EQU P0.1
+ELCD_D5  EQU P0.3
+ELCD_D6  EQU P0.5
+ELCD_D7  EQU P0.7
+
+; ---------------- LCD driver (4-bit no RW) ----------------
+Wait40uSec:
+    push AR0
+    mov R0, #190
+L40: nop
+     nop
+     nop
+     nop
+     djnz R0, L40
+    pop AR0
+    ret
+
+WaitMS mac
+    push AR2
+    mov R2, %0
+    lcall ?WaitMS
+    pop AR2
+endmac
+
+?WaitMS:
+    push AR0
+    push AR1
+L3: mov R1, #50
+L2: mov R0, #223
+L1: djnz R0, L1
+    djnz R1, L2
+    djnz R2, L3
+    pop AR1
+    pop AR0
+    ret
+
+ELCD_pulse:
+    setb ELCD_E
+    lcall Wait40uSec
+    clr ELCD_E
+    lcall Wait40uSec
+    ret
+
+ELCD_byte:
+    mov c, ACC.7
+    mov ELCD_D7, c
+    mov c, ACC.6
+    mov ELCD_D6, c
+    mov c, ACC.5
+    mov ELCD_D5, c
+    mov c, ACC.4
+    mov ELCD_D4, c
+    lcall ELCD_pulse
+
+    mov c, ACC.3
+    mov ELCD_D7, c
+    mov c, ACC.2
+    mov ELCD_D6, c
+    mov c, ACC.1
+    mov ELCD_D5, c
+    mov c, ACC.0
+    mov ELCD_D4, c
+    lcall ELCD_pulse
+    ret
+
+?WriteData:
+    setb ELCD_RS
+    ljmp ELCD_byte
+
+?WriteCommand:
+    clr ELCD_RS
+    ljmp ELCD_byte
+
+WriteData mac
+    mov a, %0
+    lcall ?WriteData
+endmac
+
+WriteCommand mac
+    mov a, %0
+    lcall ?WriteCommand
+endmac
+
+ELCD_4BIT:
+    clr ELCD_E
+    WaitMS(#40)
+    WriteCommand(#033h)
+    WriteCommand(#033h)
+    WriteCommand(#032h)
+    WriteCommand(#028h)
+    WriteCommand(#00Ch)
+    WriteCommand(#001h)
+    WaitMS(#2)
+    ret
+
+Send_Constant_String:
+    clr a
+    movc a, @a+dptr
+    jz Sdone
+    lcall ?WriteData
+    inc dptr
+    ljmp Send_Constant_String
+Sdone:
+    ret
+
+; ---------------- main ----------------
+SegTable:
+    db 03Fh,006h,05Bh,04Fh,066h,06Dh,07Dh,007h,07Fh,06Fh
+
+main:
+    mov SP, #7Fh
+
+    ; set LCD pins output
+    orl P0MOD, #0AAh
+    orl P1MOD, #082h
+
+    ; show 0,1,2 on HEX0..2
+    mov dptr, #SegTable
+    mov a, #0
+    movc a, @a+dptr
+    mov HEX0, a
+    mov a, #1
+    movc a, @a+dptr
+    mov HEX1, a
+    mov a, #2
+    movc a, @a+dptr
+    mov HEX2, a
+
+    ; init LCD and print
+    WaitMS(#200)
+    lcall ELCD_4BIT
+    WriteCommand(#080h)       ; row1 col1
+    mov dptr, #MSG
+    lcall Send_Constant_String
+
+; blink LEDR0 forever
+Loop:
+    mov a, LEDRA
+    xrl a, #01h
+    mov LEDRA, a
+    WaitMS(#200)
+    ljmp Loop
+
+MSG:
+    db 'LCD OK',0
+
+END
