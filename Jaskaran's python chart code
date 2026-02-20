@@ -1,0 +1,282 @@
+import time
+import math
+import re
+from collections import deque
+
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+PORT = "COM3"
+BAUD = 115200
+
+WINDOW_SECONDS = 120
+Y_MIN, Y_MAX = 0, 270
+
+ANIM_INTERVAL_MS = 30  # 15–40 typical
+
+# Smoothing: EMA time constant (seconds). Larger = smoother but more lag
+SMOOTH_TAU = 2.0
+
+# Derivative axis limits (°C/s)
+RATE_Y_MIN, RATE_Y_MAX = -50, 50
+# -----------------------------
+
+ser = serial.Serial(PORT, BAUD, timeout=0)
+
+# Rolling buffers (time-based window)
+t_raw = deque()
+T_raw = deque()
+
+t_smooth = deque()
+T_smooth = deque()
+
+t_rate = deque()
+dTdt = deque()
+
+t0 = None
+
+latest_t = None
+latest_T = None
+latest_Ts = None
+latest_dTdt = None
+
+s_temp = None
+r_temp = None
+
+
+rx_buf = bytearray()
+
+LINE_RE = re.compile(r"^\s*([TSR])\s*=\s*([0-9]+(?:\.[0-9]*)?)\s*$", re.IGNORECASE)
+
+def parse_line(line: str):
+    m = LINE_RE.match(line)
+    if not m:
+        return None, None
+    return m.group(1).upper(), float(m.group(2))
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def fmt_or_dash(x, fmt="{:.2f}"):
+    return "—" if x is None else fmt.format(x)
+
+def pump_serial():
+    global rx_buf, t0
+    global latest_t, latest_T, latest_Ts, latest_dTdt
+    global s_temp, r_temp
+
+    n = ser.in_waiting
+    if n <= 0:
+        return
+
+    rx_buf += ser.read(n)
+
+    while True:
+        nl = rx_buf.find(b"\n")
+        if nl < 0:
+            break
+
+        raw_line = rx_buf[:nl + 1]
+        del rx_buf[:nl + 1]
+
+        try:
+            line = raw_line.decode("ascii", errors="ignore").strip()
+        except:
+            continue
+
+        tag, val = parse_line(line)
+        if tag is None:
+            continue
+
+        if tag == "S":
+            s_temp = val
+            continue
+        if tag == "R":
+            r_temp = val
+            continue
+
+        # tag == "T"
+        if t0 is None:
+            t0 = time.time()
+
+        t = time.time() - t0
+        latest_t = t
+        latest_T = val
+
+        # Append raw 
+        t_raw.append(t)
+        T_raw.append(val)
+
+        # EMA smoothing
+        if not T_smooth:
+            Ts = val
+        else:
+            dt = t - t_smooth[-1]
+            if dt <= 0:
+                dt = 1e-6
+            alpha = 1.0 - math.exp(-dt / SMOOTH_TAU)
+            Ts = T_smooth[-1] + alpha * (val - T_smooth[-1])
+
+        t_smooth.append(t)
+        T_smooth.append(Ts)
+        latest_Ts = Ts
+
+        # Rate from raw temp
+        if len(T_raw) >= 2:
+            dt = t_raw[-1] - t_raw[-2]
+            if dt <= 0:
+                dt = 1e-6
+
+            raw_rate = (T_raw[-1] - T_raw[-2]) / dt
+
+            # smoothing of rate 
+            if not dTdt:
+                rate = raw_rate
+            else:
+                beta = 0.2   # smoothing factor (0.1–0.3 typical)
+                rate = dTdt[-1] + beta * (raw_rate - dTdt[-1])
+
+            t_rate.append(t)
+            dTdt.append(rate)
+            latest_dTdt = rate
+
+        #  Trim old data 
+        t_min = t - WINDOW_SECONDS
+
+        while t_raw and t_raw[0] < t_min:
+            t_raw.popleft(); T_raw.popleft()
+
+        while t_smooth and t_smooth[0] < t_min:
+            t_smooth.popleft(); T_smooth.popleft()
+
+        while t_rate and t_rate[0] < t_min:
+            t_rate.popleft(); dTdt.popleft()
+
+
+# PLOT SETUP (2 subplots, shared x axis)
+
+fig, (axT, axR) = plt.subplots(2, 1, sharex=True, figsize=(12, 7))
+fig.suptitle("Reflow Oven Temperature & Rate of Change", fontsize=14)
+
+# Top: Temperature 
+axT.set_ylabel("Temperature (°C)")
+axT.set_ylim(Y_MIN, Y_MAX)
+axT.grid(True)
+
+
+
+(line_raw,) = axT.plot([], [], linewidth=1.0, alpha=0.6, label="Raw T")
+(line_smooth,) = axT.plot([], [], linewidth=2.0, label=f"Smoothed T")
+
+(line_S,) = axT.plot([], [], linestyle="--", linewidth=1)
+(line_R,) = axT.plot([], [], linestyle="--", linewidth=1)
+
+s_lbl = axT.text(0, 0, "", fontsize=10, va="bottom")
+r_lbl = axT.text(0, 0, "", fontsize=10, va="bottom")
+
+val_box = axT.text(
+    0, 0, "",
+    ha="left", va="bottom",
+    bbox=dict(boxstyle="square", fc="white", ec="black"),
+    fontsize=10
+)
+
+axT.legend(loc="upper left")
+
+# Bottom: Rate 
+axR.set_xlabel("Time (s)")
+axR.set_ylabel("Rate (°C/s)")
+axR.set_ylim(RATE_Y_MIN, RATE_Y_MAX)
+axR.grid(True)
+
+(line_rate,) = axR.plot([], [], linewidth=1.5, label="dT/dt")
+axR.legend(loc="upper left")
+
+def init():
+    axT.set_xlim(0, WINDOW_SECONDS)
+
+    line_raw.set_data([], [])
+    line_smooth.set_data([], [])
+    line_rate.set_data([], [])
+
+    line_S.set_data([], [])
+    line_R.set_data([], [])
+    s_lbl.set_text("")
+    r_lbl.set_text("")
+    val_box.set_text("")
+    return (line_raw, line_smooth, line_rate, line_S, line_R, s_lbl, r_lbl, val_box)
+
+def update(_frame):
+    pump_serial()
+
+    # X window
+    if t_raw:
+        x_right = t_raw[-1]
+        if x_right < WINDOW_SECONDS:
+            x_left = 0
+            x_right = WINDOW_SECONDS
+        else:
+            x_left = x_right - WINDOW_SECONDS
+        axT.set_xlim(x_left, x_right)
+
+        # Update traces
+        line_raw.set_data(t_raw, T_raw)
+        line_smooth.set_data(t_smooth, T_smooth)
+        line_rate.set_data(t_rate, dTdt)
+    else:
+        x_left, x_right = 0, WINDOW_SECONDS
+        axT.set_xlim(x_left, x_right)
+
+    # Value box (near latest point on TEMP plot)
+    if latest_t is not None and latest_T is not None:
+        dx = 0.02 * WINDOW_SECONDS
+        dy = 5
+
+        px = clamp(latest_t + dx, x_left, x_right - 0.01 * WINDOW_SECONDS)
+        py = clamp(latest_T + dy, Y_MIN + 2, Y_MAX - 2)
+
+        val_box.set_text(
+            f"  Traw = {latest_T:.2f} °C\n"
+            f"  Ts   = {fmt_or_dash(latest_Ts)} °C\n"
+            f"  dT/dt= {fmt_or_dash(latest_dTdt)} °C/s\n"
+            f"  t = {latest_t:.1f} s"
+        )
+        val_box.set_position((px, py))
+
+    # S line + label
+    if s_temp is not None:
+        line_S.set_data([x_left, x_right], [s_temp, s_temp])
+        sx = x_right - 0.18 * WINDOW_SECONDS
+        s_lbl.set_position((sx, s_temp))
+        s_lbl.set_text(f"S Temp = {s_temp:.0f} °C")
+    else:
+        line_S.set_data([], [])
+        s_lbl.set_text("")
+
+    # R line + label
+    if r_temp is not None:
+        line_R.set_data([x_left, x_right], [r_temp, r_temp])
+        rx = x_right - 0.18 * WINDOW_SECONDS
+        r_lbl.set_position((rx, r_temp))
+        r_lbl.set_text(f"R Temp = {r_temp:.0f} °C")
+    else:
+        line_R.set_data([], [])
+        r_lbl.set_text("")
+
+    return (line_raw, line_smooth, line_rate, line_S, line_R, s_lbl, r_lbl, val_box)
+
+ani = FuncAnimation(
+    fig,
+    update,
+    init_func=init,
+    interval=ANIM_INTERVAL_MS,
+    blit=False
+)
+
+plt.tight_layout()
+plt.show()
+ser.close()
